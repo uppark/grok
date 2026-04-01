@@ -1,6 +1,9 @@
 """freemail 简单桌面 UI."""
+import os
+import tempfile
 import threading
 import tkinter as tk
+import webbrowser
 from tkinter import messagebox, ttk
 from tkinter.scrolledtext import ScrolledText
 from typing import Any, Callable, Optional
@@ -21,10 +24,13 @@ class FreemailUI(tk.Tk):
         self.selected_mailbox: Optional[str] = None
         self.selected_email_id: Optional[int] = None
         self.pending_mailbox_to_select: Optional[str] = None
+        self._current_html: str = ""
+        self._temp_html_path: Optional[str] = None
 
         self.status_var = tk.StringVar(value="就绪")
-        self.mailbox_limit_var = tk.IntVar(value=50)
-        self.email_limit_var = tk.IntVar(value=20)
+        self.mailbox_limit_var = tk.IntVar(value=200)
+        self.email_limit_var = tk.IntVar(value=50)
+        self.mailbox_offset_var = tk.IntVar(value=0)
         self.current_mailbox_var = tk.StringVar(value="")
         self.subject_var = tk.StringVar(value="-")
         self.sender_var = tk.StringVar(value="-")
@@ -59,17 +65,25 @@ class FreemailUI(tk.Tk):
         ttk.Button(toolbar, text="刷新邮箱", command=self.refresh_mailboxes).pack(
             side=tk.LEFT, padx=(8, 0)
         )
-        ttk.Label(toolbar, text="邮箱数量").pack(side=tk.LEFT, padx=(16, 6))
+        ttk.Label(toolbar, text="每页").pack(side=tk.LEFT, padx=(12, 4))
         ttk.Spinbox(
             toolbar,
-            from_=1,
-            to=500,
-            width=6,
+            from_=10,
+            to=9999,
+            width=5,
             textvariable=self.mailbox_limit_var,
         ).pack(side=tk.LEFT)
+        ttk.Button(toolbar, text="<", width=2, command=self.prev_mailbox_page).pack(
+            side=tk.LEFT, padx=(6, 0)
+        )
+        self.mailbox_page_label = ttk.Label(toolbar, text="第1页")
+        self.mailbox_page_label.pack(side=tk.LEFT, padx=2)
+        ttk.Button(toolbar, text=">", width=2, command=self.next_mailbox_page).pack(
+            side=tk.LEFT
+        )
 
         ttk.Separator(toolbar, orient=tk.VERTICAL).pack(
-            side=tk.LEFT, fill=tk.Y, padx=12
+            side=tk.LEFT, fill=tk.Y, padx=10
         )
 
         ttk.Button(toolbar, text="刷新邮件", command=self.refresh_emails).pack(
@@ -78,17 +92,17 @@ class FreemailUI(tk.Tk):
         ttk.Button(toolbar, text="最新邮件", command=self.load_latest_email).pack(
             side=tk.LEFT, padx=(8, 0)
         )
-        ttk.Label(toolbar, text="邮件数量").pack(side=tk.LEFT, padx=(16, 6))
+        ttk.Label(toolbar, text="数量").pack(side=tk.LEFT, padx=(12, 4))
         ttk.Spinbox(
             toolbar,
             from_=1,
-            to=50,
-            width=6,
+            to=200,
+            width=4,
             textvariable=self.email_limit_var,
         ).pack(side=tk.LEFT)
 
         ttk.Separator(toolbar, orient=tk.VERTICAL).pack(
-            side=tk.LEFT, fill=tk.Y, padx=12
+            side=tk.LEFT, fill=tk.Y, padx=10
         )
 
         ttk.Button(toolbar, text="复制邮箱", command=self.copy_selected_mailbox).pack(
@@ -196,8 +210,10 @@ class FreemailUI(tk.Tk):
 
         text_tab = ttk.Frame(notebook)
         html_tab = ttk.Frame(notebook)
+        source_tab = ttk.Frame(notebook)
         notebook.add(text_tab, text="纯文本")
-        notebook.add(html_tab, text="HTML")
+        notebook.add(html_tab, text="HTML 预览")
+        notebook.add(source_tab, text="HTML 源码")
 
         self.text_content = ScrolledText(
             text_tab,
@@ -206,8 +222,41 @@ class FreemailUI(tk.Tk):
         )
         self.text_content.pack(fill=tk.BOTH, expand=True)
 
-        self.html_content = ScrolledText(
+        html_toolbar = ttk.Frame(html_tab)
+        html_toolbar.pack(fill=tk.X, pady=(0, 6))
+        self.btn_open_browser = ttk.Button(
+            html_toolbar,
+            text="在浏览器中打开（可点击链接）",
+            command=self.open_html_in_browser,
+        )
+        self.btn_open_browser.pack(side=tk.LEFT)
+        ttk.Button(
+            html_toolbar,
+            text="复制所有链接",
+            command=self.copy_html_links,
+        ).pack(side=tk.LEFT, padx=(8, 0))
+        self.html_links_label = ttk.Label(html_toolbar, text="")
+        self.html_links_label.pack(side=tk.LEFT, padx=(12, 0))
+
+        self.html_link_list = tk.Listbox(
             html_tab,
+            font=("Consolas", 10),
+            height=6,
+            selectmode=tk.SINGLE,
+        )
+        self.html_link_list.pack(fill=tk.X, pady=(0, 6))
+        self.html_link_list.bind("<Double-1>", self._on_link_double_click)
+
+        self.html_preview = ScrolledText(
+            html_tab,
+            wrap=tk.WORD,
+            font=("Microsoft YaHei UI", 10),
+        )
+        self.html_preview.pack(fill=tk.BOTH, expand=True)
+        self.html_preview.tag_configure("link", foreground="blue", underline=True)
+
+        self.html_content = ScrolledText(
+            source_tab,
             wrap=tk.WORD,
             font=("Consolas", 10),
         )
@@ -326,7 +375,11 @@ class FreemailUI(tk.Tk):
         self.code_var.set(detail.get("verification_code") or "-")
 
         self._set_text_widget(self.text_content, detail.get("content") or "")
-        self._set_text_widget(self.html_content, detail.get("html_content") or "")
+
+        html = detail.get("html_content") or ""
+        self._current_html = html
+        self._set_text_widget(self.html_content, html)
+        self._update_html_preview(html)
 
     def _set_text_widget(self, widget: ScrolledText, content: str) -> None:
         widget.configure(state=tk.NORMAL)
@@ -336,6 +389,7 @@ class FreemailUI(tk.Tk):
 
     def clear_email_detail(self) -> None:
         self.selected_email_id = None
+        self._current_html = ""
         self.subject_var.set("-")
         self.sender_var.set("-")
         self.to_var.set("-")
@@ -343,15 +397,145 @@ class FreemailUI(tk.Tk):
         self.code_var.set("-")
         self._set_text_widget(self.text_content, "")
         self._set_text_widget(self.html_content, "")
+        self._set_text_widget(self.html_preview, "")
+        self.html_link_list.delete(0, tk.END)
+        self.html_links_label.config(text="")
+
+    def _extract_links(self, html: str) -> list[str]:
+        import re
+        return re.findall(r'href=["\']([^"\']+)["\']', html, re.IGNORECASE)
+
+    def _update_html_preview(self, html: str) -> None:
+        import re
+        if not html:
+            self._set_text_widget(self.html_preview, "(无 HTML 内容)")
+            self.html_link_list.delete(0, tk.END)
+            self.html_links_label.config(text="")
+            return
+
+        text = re.sub(r'<style[^>]*>.*?</style>', '', html, flags=re.DOTALL | re.IGNORECASE)
+        text = re.sub(r'<script[^>]*>.*?</script>', '', text, flags=re.DOTALL | re.IGNORECASE)
+        text = re.sub(r'<br\s*/?\s*>', '\n', text, flags=re.IGNORECASE)
+        text = re.sub(r'</p>', '\n\n', text, flags=re.IGNORECASE)
+        text = re.sub(r'</div>', '\n', text, flags=re.IGNORECASE)
+        text = re.sub(r'</tr>', '\n', text, flags=re.IGNORECASE)
+        text = re.sub(r'</li>', '\n', text, flags=re.IGNORECASE)
+        text = re.sub(r'<[^>]+>', '', text)
+        text = re.sub(r'&nbsp;', ' ', text)
+        text = re.sub(r'&amp;', '&', text)
+        text = re.sub(r'&lt;', '<', text)
+        text = re.sub(r'&gt;', '>', text)
+        text = re.sub(r'&quot;', '"', text)
+        text = re.sub(r'&#\d+;', '', text)
+        text = re.sub(r'\n{3,}', '\n\n', text)
+        self._set_text_widget(self.html_preview, text.strip())
+
+        links = self._extract_links(html)
+        real_links = [l for l in links if l.startswith(('http://', 'https://'))]
+        self.html_link_list.delete(0, tk.END)
+        for link in real_links:
+            self.html_link_list.insert(tk.END, link)
+        count = len(real_links)
+        self.html_links_label.config(text=f"共 {count} 个链接（双击打开）" if count else "无链接")
+
+    def _on_link_double_click(self, _event: Optional[tk.Event] = None) -> None:
+        selection = self.html_link_list.curselection()
+        if not selection:
+            return
+        url = self.html_link_list.get(selection[0])
+        if url:
+            webbrowser.open(url)
+            self.set_status(f"已在浏览器中打开: {url}")
+
+    def open_html_in_browser(self) -> None:
+        if not self._current_html:
+            messagebox.showinfo("提示", "当前邮件没有 HTML 内容。")
+            return
+
+        subject = self.subject_var.get()
+        sender = self.sender_var.get()
+        time_str = self.time_var.get()
+
+        wrapper = f"""<!DOCTYPE html>
+<html><head><meta charset="utf-8">
+<title>{subject}</title>
+<style>
+body {{ font-family: -apple-system, 'Microsoft YaHei UI', sans-serif; margin: 0; padding: 20px; background: #f5f5f5; }}
+.header {{ background: #fff; border: 1px solid #ddd; border-radius: 8px; padding: 16px 20px; margin-bottom: 16px; }}
+.header h2 {{ margin: 0 0 8px; color: #333; }}
+.header .meta {{ color: #666; font-size: 14px; }}
+.content {{ background: #fff; border: 1px solid #ddd; border-radius: 8px; padding: 20px; }}
+</style></head><body>
+<div class="header">
+<h2>{subject}</h2>
+<div class="meta">发件人: {sender} | 时间: {time_str}</div>
+</div>
+<div class="content">{self._current_html}</div>
+</body></html>"""
+
+        try:
+            if self._temp_html_path and os.path.exists(self._temp_html_path):
+                os.unlink(self._temp_html_path)
+        except OSError:
+            pass
+
+        fd, path = tempfile.mkstemp(suffix=".html", prefix="freemail_")
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(wrapper)
+        self._temp_html_path = path
+        webbrowser.open(f"file:///{path}")
+        self.set_status("已在浏览器中打开 HTML 邮件")
+
+    def copy_html_links(self) -> None:
+        if not self._current_html:
+            messagebox.showinfo("提示", "当前邮件没有 HTML 内容。")
+            return
+        links = [l for l in self._extract_links(self._current_html)
+                 if l.startswith(('http://', 'https://'))]
+        if not links:
+            messagebox.showinfo("提示", "此邮件中没有找到链接。")
+            return
+        self.clipboard_clear()
+        self.clipboard_append("\n".join(links))
+        self.set_status(f"已复制 {len(links)} 个链接到剪贴板")
+
+    def prev_mailbox_page(self) -> None:
+        limit = self.mailbox_limit_var.get()
+        offset = self.mailbox_offset_var.get()
+        new_offset = max(0, offset - limit)
+        self.mailbox_offset_var.set(new_offset)
+        self._update_page_label()
+        self.refresh_mailboxes()
+
+    def next_mailbox_page(self) -> None:
+        limit = self.mailbox_limit_var.get()
+        offset = self.mailbox_offset_var.get()
+        if len(self.mailboxes) >= limit:
+            self.mailbox_offset_var.set(offset + limit)
+            self._update_page_label()
+            self.refresh_mailboxes()
+
+    def _update_page_label(self) -> None:
+        limit = self.mailbox_limit_var.get()
+        offset = self.mailbox_offset_var.get()
+        page = (offset // limit) + 1 if limit > 0 else 1
+        self.mailbox_page_label.config(text=f"第{page}页")
 
     def refresh_mailboxes(self) -> None:
         limit = self.mailbox_limit_var.get()
+        offset = self.mailbox_offset_var.get()
         self.run_task(
-            lambda: self.service.list_mailboxes(limit=limit),
+            lambda: self.service.list_mailboxes(limit=limit, offset=offset),
             loading_message="正在获取邮箱列表...",
             success_message="邮箱列表已更新",
-            callback=self.populate_mailboxes,
+            callback=self._on_mailboxes_loaded,
         )
+
+    def _on_mailboxes_loaded(self, mailboxes: list[dict[str, Any]]) -> None:
+        self.populate_mailboxes(mailboxes)
+        self._update_page_label()
+        total_info = f" (本页 {len(mailboxes)} 个)"
+        self.set_status(f"邮箱列表已更新{total_info}")
 
     def generate_mailbox(self) -> None:
         def on_done(result: dict[str, Any]) -> None:
@@ -467,6 +651,16 @@ class FreemailUI(tk.Tk):
 
 def main() -> int:
     app = FreemailUI()
+
+    def on_close():
+        if app._temp_html_path:
+            try:
+                os.unlink(app._temp_html_path)
+            except OSError:
+                pass
+        app.destroy()
+
+    app.protocol("WM_DELETE_WINDOW", on_close)
     app.mainloop()
     return 0
 
